@@ -6,8 +6,30 @@ import { Upload, FileText, CheckCircle, Clock, AlertCircle, Download, ChevronRig
 import * as XLSX from 'xlsx';
 import { motion, AnimatePresence } from 'motion/react';
 
-// Initialize Gemini API
-const ai = new GoogleGenAI({ apiKey: process.env.NEXT_PUBLIC_GEMINI_API_KEY });
+// Initialize Gemini API (Default/Free Quota)
+const defaultAi = new GoogleGenAI({ apiKey: process.env.NEXT_PUBLIC_GEMINI_API_KEY });
+
+// Initialize Personal Gemini API (Fallback)
+const personalAi = process.env.NEXT_PUBLIC_PERSONAL_GEMINI_API_KEY 
+  ? new GoogleGenAI({ apiKey: process.env.NEXT_PUBLIC_PERSONAL_GEMINI_API_KEY }) 
+  : null;
+
+// Wrapper to handle quota fallback
+async function generateContentWithFallback(params: any) {
+  try {
+    return await defaultAi.models.generateContent(params);
+  } catch (error: any) {
+    const isQuotaError = error.status === 429 || 
+                         (error.message && error.message.includes('429')) || 
+                         (error.message && error.message.toLowerCase().includes('quota'));
+                         
+    if (isQuotaError && personalAi) {
+      console.warn("Cota gratuita excedida (429). Tentando novamente com a chave de API pessoal...");
+      return await personalAi.models.generateContent(params);
+    }
+    throw error;
+  }
+}
 
 type AppState = 'upload' | 'analyzing' | 'preview' | 'extracting' | 'result';
 
@@ -113,8 +135,8 @@ export default function PontoExtractor() {
       const base64Data = await fileToBase64(file);
       const mimeType = file.type;
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-3.1-pro-preview',
+      const response = await generateContentWithFallback({
+        model: 'gemini-3-flash-preview',
         contents: [
           {
             inlineData: {
@@ -165,7 +187,11 @@ export default function PontoExtractor() {
     } catch (err: any) {
       stopTimer();
       console.error(err);
-      setError(err.message || 'Ocorreu um erro durante a análise.');
+      let errorMessage = err.message || 'Ocorreu um erro durante a análise.';
+      if (errorMessage.includes('Rpc failed due to xhr error') || errorMessage.includes('413')) {
+        errorMessage = 'O arquivo é muito grande ou a conexão expirou. Tente usar um arquivo menor ou dividi-lo em partes.';
+      }
+      setError(errorMessage);
       setAppState('upload');
     }
   };
@@ -190,8 +216,8 @@ Para cada dia do mês, extraia:
 - Se o dia não tiver horários, mas tiver um texto (ex: 'domingo', 'feriado', 'férias'), ignore o texto e deixe a lista de horários vazia.
 Retorne os dados de todos os meses encontrados, agrupados por mês.`;
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-3.1-pro-preview',
+      const response = await generateContentWithFallback({
+        model: 'gemini-3-flash-preview',
         contents: [
           {
             inlineData: {
@@ -255,7 +281,11 @@ Retorne os dados de todos os meses encontrados, agrupados por mês.`;
     } catch (err: any) {
       stopTimer();
       console.error(err);
-      setError(err.message || 'Ocorreu um erro durante a extração.');
+      let errorMessage = err.message || 'Ocorreu um erro durante a extração.';
+      if (errorMessage.includes('Rpc failed due to xhr error') || errorMessage.includes('413')) {
+        errorMessage = 'O arquivo é muito grande ou a conexão expirou. Tente usar um arquivo menor ou dividi-lo em partes.';
+      }
+      setError(errorMessage);
       setAppState('preview');
     }
   };
