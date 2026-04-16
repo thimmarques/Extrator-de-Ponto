@@ -1,0 +1,6 @@
+{
+  "name": "PontoExtract",
+  "description": "Aplicativo para extração de dados de cartões de ponto usando IA. Permite selecionar colunas, formatar horários e exportar para Excel.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
