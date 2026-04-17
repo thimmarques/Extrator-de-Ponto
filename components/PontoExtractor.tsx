@@ -6,16 +6,34 @@ import { Upload, FileText, CheckCircle, Clock, AlertCircle, Download, ChevronRig
 import * as XLSX from 'xlsx';
 import { motion, AnimatePresence } from 'motion/react';
 
-// Initialize Gemini API (Default/Free Quota)
-const defaultAi = new GoogleGenAI({ apiKey: process.env.NEXT_PUBLIC_GEMINI_API_KEY });
+// Lazy initialization of Gemini API clients
+let defaultAiClient: any = null;
+let personalAiClient: any = null;
 
-// Initialize Personal Gemini API (Fallback)
-const personalAi = process.env.NEXT_PUBLIC_PERSONAL_GEMINI_API_KEY 
-  ? new GoogleGenAI({ apiKey: process.env.NEXT_PUBLIC_PERSONAL_GEMINI_API_KEY }) 
-  : null;
+function getAiClient(isPersonal = false) {
+  const apiKey = isPersonal 
+    ? process.env.NEXT_PUBLIC_PERSONAL_GEMINI_API_KEY 
+    : process.env.NEXT_PUBLIC_GEMINI_API_KEY;
+
+  if (!apiKey) {
+    if (isPersonal) return null;
+    throw new Error('API Key do Gemini não encontrada. Configure NEXT_PUBLIC_GEMINI_API_KEY nas variáveis de ambiente.');
+  }
+
+  if (isPersonal) {
+    if (!personalAiClient) personalAiClient = new GoogleGenAI({ apiKey });
+    return personalAiClient;
+  } else {
+    if (!defaultAiClient) defaultAiClient = new GoogleGenAI({ apiKey });
+    return defaultAiClient;
+  }
+}
 
 // Wrapper to handle quota fallback
 async function generateContentWithFallback(params: any) {
+  const defaultAi = getAiClient(false);
+  const personalAi = getAiClient(true);
+
   try {
     return await defaultAi.models.generateContent(params);
   } catch (error: any) {
@@ -210,11 +228,15 @@ export default function PontoExtractor() {
 
       const prompt = `Extraia os dados deste cartão de ponto APENAS para as seguintes colunas de horários: ${selectedCols}.
 O documento pode conter várias páginas (ex: uma página para cada mês). Você deve analisar TODAS as páginas do documento.
-Para cada dia do mês, extraia:
-- O dia (número).
-- Os horários registrados nas colunas selecionadas. Formate os horários substituindo ':' por ',' (ex: 08:00 -> 08,00).
-- Se o dia não tiver horários, mas tiver um texto (ex: 'domingo', 'feriado', 'férias'), ignore o texto e deixe a lista de horários vazia.
-Retorne os dados de todos os meses encontrados, agrupados por mês.`;
+
+Instruções importantes:
+1. Para cada dia do mês, extraia o dia (número) e os horários registrados nas colunas selecionadas.
+2. Formate os horários substituindo ':' por ',' (ex: 08:00 -> 08,00).
+3. ATENÇÃO: Se houver horários registrados em feriados, domingos ou folgas, você deve extraí-los normalmente. Só deixe vazio se REALMENTE não houver marcação de horário.
+4. QUALIDADE DOS DADOS: Se você tiver dificuldade em ler um horário ou se o valor identificado parecer claramente incorreto/divergente para um registro de ponto (ilegível), coloque a palavra "VERIFICAR" no lugar do horário para que o usuário confira.
+5. Se o dia não tiver horários, mas tiver apenas um texto (ex: 'domingo', 'feriado', 'férias'), ignore o texto e deixe a lista de horários vazia.
+
+Retorne os dados de todos os meses encontrados, agrupados por mês seguindo o esquema JSON fornecido.`;
 
       const response = await generateContentWithFallback({
         model: 'gemini-3-flash-preview',
