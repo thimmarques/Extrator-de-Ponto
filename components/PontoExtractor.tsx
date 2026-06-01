@@ -2,7 +2,7 @@
 
 import React, { useState, useRef, useEffect } from 'react';
 import { GoogleGenAI, Type, Schema } from '@google/genai';
-import { Upload, FileText, CheckCircle, Clock, AlertCircle, Download, ChevronRight, FileSpreadsheet, Trash2 } from 'lucide-react';
+import { Upload, FileText, CheckCircle, Clock, AlertCircle, Download, ChevronRight, ChevronDown, FileSpreadsheet, Trash2 } from 'lucide-react';
 import * as XLSX from 'xlsx';
 import { motion, AnimatePresence } from 'motion/react';
 
@@ -49,7 +49,13 @@ async function generateContentWithFallback(params: any) {
   }
 }
 
-type AppState = 'upload' | 'analyzing' | 'preview' | 'extracting' | 'result';
+type AppState = 'upload' | 'analyzing' | 'preview' | 'extracting' | 'result' | 'next_prompt';
+
+interface FileObject {
+  id: string;
+  file: File;
+  status: 'pending' | 'extracted';
+}
 
 interface ColumnDef {
   id: string;
@@ -76,12 +82,14 @@ interface ExportHistory {
 
 export default function PontoExtractor() {
   const [appState, setAppState] = useState<AppState>('upload');
-  const [file, setFile] = useState<File | null>(null);
+  const [files, setFiles] = useState<FileObject[]>([]);
+  const [currentFileIndex, setCurrentFileIndex] = useState<number>(-1);
   const [modelFile, setModelFile] = useState<File | null>(null);
   const [columns, setColumns] = useState<ColumnDef[]>([]);
   const [period, setPeriod] = useState<string>('');
   const [extractedData, setExtractedData] = useState<ExtractedMonth[]>([]);
   const [history, setHistory] = useState<ExportHistory[]>([]);
+  const [expandedDates, setExpandedDates] = useState<Record<string, boolean>>({});
   const [error, setError] = useState<string | null>(null);
   
   // Timer state
@@ -142,16 +150,19 @@ export default function PontoExtractor() {
     });
   };
 
-  const handlePreAnalysis = async () => {
-    if (!file) return;
+  const handlePreAnalysis = async (index?: number) => {
+    const targetIndex = index !== undefined ? index : currentFileIndex;
+    const currentFile = files[targetIndex]?.file;
+    if (!currentFile) return;
     
+    setCurrentFileIndex(targetIndex);
     setAppState('analyzing');
     setError(null);
     startTimer();
 
     try {
-      const base64Data = await fileToBase64(file);
-      const mimeType = file.type;
+      const base64Data = await fileToBase64(currentFile);
+      const mimeType = currentFile.type;
 
       const response = await generateContentWithFallback({
         model: 'gemini-3-flash-preview',
@@ -215,15 +226,16 @@ export default function PontoExtractor() {
   };
 
   const handleExtraction = async () => {
-    if (!file) return;
+    const currentFile = files[currentFileIndex]?.file;
+    if (!currentFile) return;
     
     setAppState('extracting');
     setError(null);
     startTimer();
 
     try {
-      const base64Data = await fileToBase64(file);
-      const mimeType = file.type;
+      const base64Data = await fileToBase64(currentFile);
+      const mimeType = currentFile.type;
       const selectedCols = columns.filter(c => c.selected).map(c => c.nome).join(', ');
 
       const prompt = `Extraia os dados deste cartão de ponto APENAS para as seguintes colunas de horários: ${selectedCols}.
@@ -290,12 +302,21 @@ Retorne os dados de todos os meses encontrados, agrupados por mês seguindo o es
         const newRecord: ExportHistory = {
           id: Date.now().toString(),
           date: new Date().toISOString(),
-          fileName: file.name,
+          fileName: currentFile.name,
           months: result
         };
         saveHistory([newRecord, ...history]);
         
-        setAppState('result');
+        // Mark current file as extracted
+        setFiles(prev => prev.map((f, i) => i === currentFileIndex ? { ...f, status: 'extracted' } : f));
+        
+        // Determine if there is a next file
+        const nextIndex = files.findIndex((f, i) => i > currentFileIndex && f.status === 'pending');
+        if (nextIndex !== -1) {
+          setAppState('next_prompt');
+        } else {
+          setAppState('result');
+        }
       } else {
         throw new Error('Resposta vazia da API');
       }
@@ -367,9 +388,19 @@ Retorne os dados de todos os meses encontrados, agrupados por mês seguindo o es
     setColumns(columns.map(c => c.id === id ? { ...c, selected: !c.selected } : c));
   };
 
+  const handleNextFile = () => {
+    const nextIndex = files.findIndex((f, i) => i > currentFileIndex && f.status === 'pending');
+    if (nextIndex !== -1) {
+      handlePreAnalysis(nextIndex);
+    } else {
+      setAppState('upload');
+    }
+  };
+
   const reset = () => {
     setAppState('upload');
-    setFile(null);
+    setFiles([]);
+    setCurrentFileIndex(-1);
     setModelFile(null);
     setColumns([]);
     setPeriod('');
@@ -400,34 +431,71 @@ Retorne os dados de todos os meses encontrados, agrupados por mês seguindo o es
         <aside className="bg-white border-r border-[#E2E8F0] p-6 flex flex-col gap-5 overflow-y-auto">
           <div>
             <div className="text-xs uppercase tracking-wider text-[#64748B] font-bold mb-3">Histórico de Exportação</div>
-            <div className="flex flex-col gap-2">
+            <div className="flex flex-col gap-4">
               {history.length === 0 ? (
                 <p className="text-sm text-[#64748B] text-center mt-4">Nenhum histórico encontrado.</p>
               ) : (
-                history.map(item => (
-                  <div key={item.id} className="p-3 rounded-lg border border-[#E2E8F0] bg-[#F0F2F5] hover:border-[#2563EB] transition-colors cursor-pointer group">
-                    <div className="flex justify-between items-start">
-                      <div className="truncate pr-2">
-                        <h4 className="text-sm font-semibold text-[#1E293B] mb-1 truncate" title={item.fileName}>{item.fileName}</h4>
-                        <span className="text-xs text-[#64748B]">{new Date(item.date).toLocaleDateString('pt-BR')} • {item.months.length} meses</span>
+                Object.entries(
+                  history.reduce((groups, item) => {
+                    const date = new Date(item.date);
+                    const dateKey = `${date.getDate().toString().padStart(2, '0')}/${(date.getMonth() + 1).toString().padStart(2, '0')}`;
+                    if (!groups[dateKey]) {
+                      groups[dateKey] = [];
+                    }
+                    groups[dateKey].push(item);
+                    return groups;
+                  }, {} as Record<string, ExportHistory[]>)
+                ).map(([dateKey, items]) => (
+                  <div key={dateKey} className="flex flex-col gap-2">
+                    <button 
+                      onClick={() => setExpandedDates(prev => ({ ...prev, [dateKey]: !prev[dateKey] }))}
+                      className="text-xs font-semibold text-[#64748B] flex items-center justify-between hover:text-[#1E293B] transition-colors w-full cursor-pointer outline-none"
+                    >
+                      <div className="flex items-center gap-2">
+                        <div className="w-2 h-2 rounded-full bg-[#E2E8F0]"></div>
+                        {dateKey}
                       </div>
-                      <div className="flex flex-col gap-1">
-                        <button 
-                          onClick={() => exportToExcel(item.months, item.fileName)}
-                          className="text-[#64748B] hover:text-[#2563EB] p-1"
-                          title="Exportar novamente"
+                      <ChevronDown size={14} className={`transition-transform duration-200 ${expandedDates[dateKey] ? 'rotate-180' : ''}`} />
+                    </button>
+                    <AnimatePresence initial={false}>
+                      {expandedDates[dateKey] && (
+                        <motion.div
+                          key="content"
+                          initial={{ height: 0, opacity: 0 }}
+                          animate={{ height: 'auto', opacity: 1 }}
+                          exit={{ height: 0, opacity: 0 }}
+                          transition={{ duration: 0.2 }}
+                          className="flex flex-col gap-2 overflow-hidden"
                         >
-                          <Download size={16} />
-                        </button>
-                        <button 
-                          onClick={() => deleteHistoryItem(item.id)}
-                          className="text-[#64748B] hover:text-red-600 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
-                          title="Excluir histórico"
-                        >
-                          <Trash2 size={16} />
-                        </button>
-                      </div>
-                    </div>
+                          {items.map((item) => (
+                            <div key={item.id} className="p-3 rounded-lg border border-[#E2E8F0] bg-[#F0F2F5] hover:border-[#2563EB] transition-colors cursor-pointer group">
+                              <div className="flex justify-between items-start">
+                                <div className="truncate pr-2">
+                                  <h4 className="text-sm font-semibold text-[#1E293B] mb-1 truncate" title={item.fileName}>{item.fileName}</h4>
+                                  <span className="text-xs text-[#64748B]">{item.months.length} meses</span>
+                                </div>
+                                <div className="flex flex-col gap-1">
+                                  <button 
+                                    onClick={() => exportToExcel(item.months, item.fileName)}
+                                    className="text-[#64748B] hover:text-[#2563EB] p-1"
+                                    title="Exportar novamente"
+                                  >
+                                    <Download size={16} />
+                                  </button>
+                                  <button 
+                                    onClick={() => deleteHistoryItem(item.id)}
+                                    className="text-[#64748B] hover:text-red-600 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                                    title="Excluir histórico"
+                                  >
+                                    <Trash2 size={16} />
+                                  </button>
+                                </div>
+                              </div>
+                            </div>
+                          ))}
+                        </motion.div>
+                      )}
+                    </AnimatePresence>
                   </div>
                 ))
               )}
@@ -453,7 +521,7 @@ Retorne os dados de todos os meses encontrados, agrupados por mês seguindo o es
             <div className="px-6 py-4 border-b border-[#E2E8F0] flex justify-between items-center bg-[#EFF6FF]">
               <div>
                 <h3 className="text-base font-semibold text-[#1E293B]">
-                  Documento: <span className="font-normal">{file ? file.name : 'Nenhum arquivo selecionado'}</span>
+                  Documento: <span className="font-normal">{currentFileIndex !== -1 ? files[currentFileIndex]?.file.name : 'Nenhum arquivo selecionado'}</span>
                 </h3>
                 {period && <p className="text-xs text-[#64748B] mt-1">Período Identificado: <b className="text-[#1E293B]">{period}</b></p>}
               </div>
@@ -469,19 +537,19 @@ Retorne os dados de todos os meses encontrados, agrupados por mês seguindo o es
                 )}
                 {appState === 'result' && (
                   <button 
-                    onClick={() => exportToExcel(extractedData, file?.name || 'export')}
+                    onClick={() => exportToExcel(extractedData, files[currentFileIndex]?.file.name || 'export')}
                     className="px-5 py-2.5 rounded-md bg-[#10B981] text-white font-semibold text-sm hover:bg-emerald-600 transition-colors flex items-center gap-2"
                   >
                     <Download size={16} />
                     Exportar Excel
                   </button>
                 )}
-                {(appState === 'preview' || appState === 'result') && (
+                {(appState === 'preview' || appState === 'result' || appState === 'next_prompt') && (
                   <button 
-                    onClick={reset}
+                    onClick={() => setAppState('upload')}
                     className="px-5 py-2.5 rounded-md bg-white border border-[#E2E8F0] text-[#1E293B] font-semibold text-sm hover:bg-slate-50 transition-colors"
                   >
-                    Novo Upload
+                    Lista de Arquivos
                   </button>
                 )}
               </div>
@@ -532,31 +600,76 @@ Retorne os dados de todos os meses encontrados, agrupados por mês seguindo o es
                       <div className="bg-white p-6 rounded-xl border border-[#E2E8F0]">
                         <h3 className="text-sm font-semibold text-[#1E293B] mb-2 flex items-center gap-2">
                           <FileText size={18} className="text-[#2563EB]" />
-                          Cartão de Ponto
+                          Cartões de Ponto (Múltiplos)
                         </h3>
-                        <p className="text-xs text-[#64748B] mb-4">Envie o documento com os registros de horários.</p>
+                        <p className="text-xs text-[#64748B] mb-4">Envie um ou mais documentos (.pdf, .jpg, .png).</p>
                         
-                        <label className="flex flex-col items-center justify-center w-full h-32 border-2 border-[#2563EB] border-dashed rounded-lg cursor-pointer bg-[#EFF6FF] hover:bg-blue-100 transition-colors">
-                          <div className="flex flex-col items-center justify-center pt-5 pb-6">
-                            <Upload className="w-6 h-6 mb-2 text-[#2563EB]" />
-                            <p className="text-sm text-[#64748B]">
-                              {file ? <span className="font-semibold text-[#2563EB]">{file.name}</span> : "Clique ou arraste (PDF, JPG, PNG)"}
-                            </p>
-                          </div>
-                          <input type="file" className="hidden" accept="application/pdf, image/*" onChange={(e) => setFile(e.target.files?.[0] || null)} />
-                        </label>
+                        <div className="space-y-4">
+                          <label className="flex flex-col items-center justify-center w-full h-32 border-2 border-[#2563EB] border-dashed rounded-lg cursor-pointer bg-[#EFF6FF] hover:bg-blue-100 transition-colors">
+                            <div className="flex flex-col items-center justify-center pt-5 pb-6">
+                              <Upload className="w-6 h-6 mb-2 text-[#2563EB]" />
+                              <p className="text-sm text-[#64748B]">Clique ou arraste arquivos</p>
+                            </div>
+                            <input 
+                              type="file" 
+                              className="hidden" 
+                              accept="application/pdf, image/*" 
+                              multiple 
+                              onChange={(e) => {
+                                const newFiles = Array.from(e.target.files || []).map(f => ({
+                                  id: Math.random().toString(36).substr(2, 9),
+                                  file: f,
+                                  status: 'pending' as const
+                                }));
+                                setFiles(prev => [...prev, ...newFiles]);
+                              }} 
+                            />
+                          </label>
+
+                          {files.length > 0 && (
+                            <div className="max-h-48 overflow-y-auto border border-[#E2E8F0] rounded-lg divide-y divide-[#E2E8F0]">
+                              {files.map((f, idx) => (
+                                <div key={f.id} className="p-3 flex justify-between items-center bg-white">
+                                  <div className="flex items-center gap-3 truncate">
+                                    <FileText size={14} className={f.status === 'extracted' ? 'text-[#10B981]' : 'text-[#2563EB]'} />
+                                    <span className="text-sm truncate" title={f.file.name}>{f.file.name}</span>
+                                    {f.status === 'extracted' && <span className="text-[10px] bg-emerald-100 text-emerald-700 px-1.5 py-0.5 rounded font-bold uppercase">Extraído</span>}
+                                  </div>
+                                  <button onClick={() => setFiles(prev => prev.filter(item => item.id !== f.id))} className="text-red-500 hover:text-red-700">
+                                    <Trash2 size={14} />
+                                  </button>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
                       </div>
                     </div>
 
-                    <div className="flex justify-center mt-8">
-                      <button
-                        onClick={handlePreAnalysis}
-                        disabled={!file}
-                        className="px-6 py-2.5 rounded-md bg-[#2563EB] text-white font-semibold text-sm hover:bg-blue-700 disabled:bg-slate-300 disabled:cursor-not-allowed transition-colors flex items-center gap-2"
-                      >
-                        Analisar Documento
-                        <ChevronRight size={18} />
-                      </button>
+                    <div className="flex justify-center mt-8 gap-4">
+                      {files.length > 0 && (
+                        <>
+                          <button
+                            onClick={() => {
+                              const nextPendingIndex = files.findIndex(f => f.status === 'pending');
+                              if (nextPendingIndex !== -1) {
+                                handlePreAnalysis(nextPendingIndex);
+                              }
+                            }}
+                            disabled={!files.some(f => f.status === 'pending')}
+                            className="px-6 py-2.5 rounded-md bg-[#2563EB] text-white font-semibold text-sm hover:bg-blue-700 disabled:bg-slate-300 disabled:cursor-not-allowed transition-colors flex items-center gap-2"
+                          >
+                            {files.some(f => f.status === 'extracted') ? 'Extrair Próximos' : 'Analisar Documentos'}
+                            <ChevronRight size={18} />
+                          </button>
+                          <button
+                            onClick={reset}
+                            className="px-6 py-2.5 rounded-md bg-white border border-[#E2E8F0] text-[#1E293B] font-semibold text-sm hover:bg-slate-50 transition-colors"
+                          >
+                            Limpar Tudo
+                          </button>
+                        </>
+                      )}
                     </div>
                   </motion.div>
                 )}
@@ -606,8 +719,49 @@ Retorne os dados de todos os meses encontrados, agrupados por mês seguindo o es
                       </div>
                       <h2 className="text-2xl font-bold text-[#1E293B]">Extração Concluída com Sucesso!</h2>
                       <p className="text-[#64748B] max-w-md">
-                        Os dados do documento <span className="font-semibold text-[#1E293B]">{file?.name}</span> referentes ao período <span className="font-semibold text-[#1E293B]">{period}</span> foram extraídos e estão prontos para download.
+                        Os dados do documento <span className="font-semibold text-[#1E293B]">{files[currentFileIndex]?.file.name}</span> referentes ao período <span className="font-semibold text-[#1E293B]">{period}</span> foram extraídos e estão prontos para download.
                       </p>
+                    </div>
+                  </motion.div>
+                )}
+                {appState === 'next_prompt' && (
+                  <motion.div
+                    key="next_prompt"
+                    initial={{ opacity: 0, y: 20 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="p-6"
+                  >
+                    <div className="flex flex-col items-center justify-center text-center space-y-6 py-12">
+                      <div className="w-16 h-16 bg-blue-100 rounded-full flex items-center justify-center mb-2">
+                        <FileText size={32} className="text-[#2563EB]" />
+                      </div>
+                      <div>
+                        <h2 className="text-2xl font-bold text-[#1E293B]">Extração do documento atual concluída!</h2>
+                        <p className="text-[#64748B] max-w-md mt-2">
+                          Iniciar o próximo documento <span className="font-bold text-[#1E293B]">&quot;{files.find((f, i) => i > currentFileIndex && f.status === 'pending')?.file.name}&quot;</span>?
+                        </p>
+                      </div>
+                      <div className="flex gap-4">
+                        <button 
+                          onClick={() => exportToExcel(extractedData, files[currentFileIndex]?.file.name || 'export')}
+                          className="px-8 py-3 rounded-md bg-[#10B981] text-white font-semibold hover:bg-emerald-600 transition-colors flex items-center gap-2"
+                        >
+                          <Download size={18} />
+                          Baixar Arquivo
+                        </button>
+                        <button 
+                          onClick={handleNextFile}
+                          className="px-8 py-3 rounded-md bg-[#2563EB] text-white font-semibold hover:bg-blue-700 transition-colors"
+                        >
+                          Analisar Próximo
+                        </button>
+                        <button 
+                          onClick={() => setAppState('upload')}
+                          className="px-8 py-3 rounded-md bg-white border border-[#E2E8F0] text-[#1E293B] font-semibold hover:bg-slate-50 transition-colors"
+                        >
+                          Parar
+                        </button>
+                      </div>
                     </div>
                   </motion.div>
                 )}
